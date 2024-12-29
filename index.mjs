@@ -7,7 +7,7 @@
  */
 
 /**
- * @typedef {{ includeRenamed: boolean }} ParseOptions
+ * @typedef {{ includeRenamed: boolean; includeModified: boolean; includeAdditions: boolean; includeDeletions; boolean }} ParseOptions
  */
 
 function count(/** @type Hierarchy */ hierarchy) {
