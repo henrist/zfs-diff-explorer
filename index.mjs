@@ -7,7 +7,7 @@
  */
 
 /**
- * @typedef {{ includeRenamed: boolean; includeModified: boolean; includeAdditions: boolean; includeDeletions; boolean }} ParseOptions
+ * @typedef {{ includeRenamed: boolean; includeModified: boolean; includeAdditions: boolean; includeDeletions; boolean; includeAddDel: boolean }} ParseOptions
  */
 
 function count(/** @type Hierarchy */ hierarchy) {
@@ -22,7 +22,7 @@ function count(/** @type Hierarchy */ hierarchy) {
   return c
 }
 
-function* zfsLines(/** @type string */ data, /** @type ParseOptions */ options) {
+function* zfsLines(/** @type string */ data) {
   const lines = data.split("\n")
   for (const line of lines) {
     if (line === "") continue
@@ -35,22 +35,6 @@ function* zfsLines(/** @type string */ data, /** @type ParseOptions */ options) 
     /** @type Change */
     const change = { type: m[1] }
     let path = m[2]
-
-    if (change.type === "R" && !options.includeRenamed) {
-      continue
-    }
-
-    if (change.type === "M" && !options.includeModified) {
-      continue
-    }
-
-    if (change.type === "+" && !options.includeAdditions) {
-      continue
-    }
-
-    if (change.type === "-" && !options.includeDeletions) {
-      continue
-    }
 
     if (change.type === "R") {
       const m2 = path.match(/(.+) -> (.+)$/)
@@ -106,13 +90,13 @@ function addSegments(
   addSegments(child, segments.slice(1), change, path)
 }
 
-export async function getTreeFromZfs(/** @type string */ fileData, /** @type ParseOptions */ options) {
+async function getTreeFromZfs(/** @type string */ fileData) {
   /** @type Hierarchy */
   const hierarchy = {
     children: {},
   }
 
-  for (const [change, path] of zfsLines(fileData, options)) {
+  for (const [change, path] of zfsLines(fileData)) {
     if (!path.startsWith("/")) {
       throw new Error(`Didn't start with /: ${path}`)
     }
@@ -123,6 +107,55 @@ export async function getTreeFromZfs(/** @type string */ fileData, /** @type Par
   }
 
   return hierarchy
+}
+
+function pruneTree(/** @type Hierarchy */ tree, /** @type ParseOptions */ options) {
+  const isAddDel =
+    tree.changes?.find((change) => change.type === "-") != null &&
+    tree.changes?.find((change) => change.type === "+") != null
+
+  const changes = tree.changes?.filter((change) => {
+    if (change.type === "R" && !options.includeRenamed) {
+      return false
+    }
+
+    if (change.type === "M" && !options.includeModified) {
+      return false
+    }
+
+    if (isAddDel) {
+      if (!options.includeAddDel) {
+        return false
+      }
+    } else {
+      if (change.type === "+" && !options.includeAdditions) {
+        return false
+      }
+
+      if (change.type === "-" && !options.includeDeletions) {
+        return false
+      }
+    }
+
+    return true
+  })
+
+  /** @type Hierarchy */
+  const updated = {
+    children: Object.fromEntries(
+      Object.entries(tree.children).flatMap(([key, value]) => {
+        const result = pruneTree(value, options)
+        return result ? [[key, result]] : []
+      })
+    ),
+    changes,
+  }
+
+  if (!updated.changes?.length && Object.keys(updated.children).length === 0) {
+    return undefined
+  }
+
+  return updated
 }
 
 class ChildItem extends HTMLElement {
@@ -249,6 +282,10 @@ uploadTemplate.innerHTML = `
       Show modified
     </label>
     <label>
+      <input type="checkbox" name="includeAddDel" checked />
+      Show add+del
+    </label>
+    <label>
       <input type="checkbox" name="includeAdditions" checked />
       Show additions
     </label>
@@ -260,8 +297,8 @@ uploadTemplate.innerHTML = `
 `
 
 class UploadArea extends HTMLElement {
-  /** @type string */
-  text
+  /** @type Hierarchy */
+  tree
 
   connectedCallback() {
     this.render()
@@ -272,7 +309,9 @@ class UploadArea extends HTMLElement {
 
     this.querySelector("input[type=file]").addEventListener("change", async (ev) => {
       const file = ev.currentTarget.files[0]
-      this.text = await file.text()
+      const text = await file.text()
+      this.tree = await getTreeFromZfs(text)
+      console.log("tree", this.tree)
       this.showResult()
     })
 
@@ -284,20 +323,28 @@ class UploadArea extends HTMLElement {
   }
 
   async showResult() {
-    if (!this.text) return
+    if (!this.tree) return
 
-    const tree = await getTreeFromZfs(this.text, {
+    let prunedTree = pruneTree(this.tree, {
       includeRenamed: this.querySelector("input[name=includeRenamed]").checked,
       includeModified: this.querySelector("input[name=includeModified]").checked,
       includeAdditions: this.querySelector("input[name=includeAdditions]").checked,
       includeDeletions: this.querySelector("input[name=includeDeletions]").checked,
+      includeAddDel: this.querySelector("input[name=includeAddDel]").checked,
     })
 
-    console.log("tree", tree)
+    if (!prunedTree) {
+      prunedTree = {
+        children: {},
+        changes: [],
+      }
+    }
+
+    console.log("pruned", prunedTree)
 
     document.body.querySelector("result-item")?.remove()
     const resultItem = document.createElement("result-item")
-    resultItem.tree = tree
+    resultItem.tree = prunedTree
     document.body.appendChild(resultItem)
   }
 }
