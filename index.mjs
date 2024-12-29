@@ -1,9 +1,13 @@
 /**
- * @typedef {{ change: string }} Change
+ * @typedef {{ type: string; movedTo?: string }} Change
  */
 
 /**
  * @typedef {{ children: { [key: string]: Hierarchy }; changes?: Change[] }} Hierarchy
+ */
+
+/**
+ * @typedef {{ includeRenamed: boolean }} ParseOptions
  */
 
 function count(/** @type Hierarchy */ hierarchy) {
@@ -18,7 +22,7 @@ function count(/** @type Hierarchy */ hierarchy) {
   return c
 }
 
-function* zfsLines(/** @type string */ data) {
+function* zfsLines(/** @type string */ data, /** @type ParseOptions */ options) {
   const lines = data.split("\n")
   for (const line of lines) {
     if (line === "") continue
@@ -28,8 +32,37 @@ function* zfsLines(/** @type string */ data) {
       continue
     }
 
-    /** @type {[string, string]} */
-    const res = [m[1], m[2]]
+    /** @type Change */
+    const change = { type: m[1] }
+    let path = m[2]
+
+    if (change.type === "R" && !options.includeRenamed) {
+      continue
+    }
+
+    if (change.type === "M" && !options.includeModified) {
+      continue
+    }
+
+    if (change.type === "+" && !options.includeAdditions) {
+      continue
+    }
+
+    if (change.type === "-" && !options.includeDeletions) {
+      continue
+    }
+
+    if (change.type === "R") {
+      const m2 = path.match(/(.+) -> (.+)$/)
+      if (!m2) {
+        throw new Error("Couldn't find new value for rename")
+      }
+      path = m2[1]
+      change.movedTo = m2[2]
+    }
+
+    /** @type {[Change, string]} */
+    const res = [change, path]
 
     yield res
   }
@@ -53,46 +86,49 @@ function getChild(/** @type Hierarchy */ hierarchy, /** @type string */ value) {
 function addSegments(
   /** @type Hierarchy */ hierarchy,
   /** @type {string[]} */ segments,
-  /** @type string */ type,
+  /** @type Change */ change,
   /** @type string */ path,
 ) {
   if (segments.length === 0) {
     hierarchy.changes ??= []
-    hierarchy.changes.push({ change: type })
+    hierarchy.changes.push(change)
     return
   }
 
   const first = segments[0]
   if (segments.length === 1 && first === "") {
     hierarchy.changes ??= []
-    hierarchy.changes.push({ change: type })
+    hierarchy.changes.push(change)
     return
   }
 
   const child = getChild(hierarchy, first)
-  addSegments(child, segments.slice(1), type, path)
+  addSegments(child, segments.slice(1), change, path)
 }
 
-export async function getTreeFromZfs(/** @type string */ fileData) {
+export async function getTreeFromZfs(/** @type string */ fileData, /** @type ParseOptions */ options) {
   /** @type Hierarchy */
   const hierarchy = {
     children: {},
   }
 
-  for (const [type, path] of zfsLines(fileData)) {
+  for (const [change, path] of zfsLines(fileData, options)) {
     if (!path.startsWith("/")) {
       throw new Error(`Didn't start with /: ${path}`)
     }
 
     const segments = path.split("/")
 
-    addSegments(hierarchy, segments, type, path)
+    addSegments(hierarchy, segments, change, path)
   }
 
   return hierarchy
 }
 
 class ChildItem extends HTMLElement {
+  /** @type boolean? */
+  isDefaultOpen
+
   #isOpen = false
 
   /** @type Hierarchy */
@@ -105,6 +141,7 @@ class ChildItem extends HTMLElement {
   depth
 
   connectedCallback() {
+    this.#isOpen = this.isDefaultOpen ?? false
     this.render()
   }
 
@@ -138,17 +175,26 @@ class ChildItem extends HTMLElement {
     for (const change of this.child.changes ?? []) {
       const span = document.createElement("span")
       span.className =
-        change.change === "-"
+        change.type === "-"
           ? "text-red-600"
-          : change.change === "+"
+          : change.type === "+"
           ? "text-green-600"
           : ""
-      span.appendChild(document.createTextNode(` ${change.change}`))
+      span.appendChild(document.createTextNode(` ${change.type}`))
+
+      if (change.movedTo) {
+        const movedToSpan = document.createElement("span")
+        movedToSpan.style.color = "#BBB"
+        movedToSpan.appendChild(document.createTextNode(` -> ${change.movedTo}`))
+        span.appendChild(movedToSpan)
+      }
+
       li.appendChild(span)
     }
 
     if (this.#isOpen) {
       const hierarchyItem = document.createElement("hierarchy-item")
+      hierarchyItem.isDefaultOpen = this.isDefaultOpen && Object.keys(this.child.children).length === 1
       hierarchyItem.hierarchy = this.child
       hierarchyItem.depth = this.depth + 1
       li.appendChild(hierarchyItem)
@@ -159,6 +205,9 @@ class ChildItem extends HTMLElement {
 }
 
 class HierarchyItem extends HTMLElement {
+  /** @type boolean? */
+  isDefaultOpen
+
   /** @type Hierarchy */
   hierarchy
 
@@ -176,6 +225,7 @@ class HierarchyItem extends HTMLElement {
       ([a], [b]) => a.localeCompare(b),
     )) {
       const childItem = document.createElement("child-item")
+      childItem.isDefaultOpen = this.isDefaultOpen
       childItem.child = child
       childItem.childKey = key
       childItem.depth = this.depth
@@ -186,30 +236,69 @@ class HierarchyItem extends HTMLElement {
   }
 }
 
+const uploadTemplate = document.createElement("template")
+uploadTemplate.innerHTML = `
+  <div>
+    <input type="file" />
+    <label>
+      <input type="checkbox" name="includeRenamed" checked />
+      Show renamed
+    </label>
+    <label>
+      <input type="checkbox" name="includeModified" checked />
+      Show modified
+    </label>
+    <label>
+      <input type="checkbox" name="includeAdditions" checked />
+      Show additions
+    </label>
+    <label>
+      <input type="checkbox" name="includeDeletions" checked />
+      Show deletions
+    </label>
+  </div>
+`
+
 class UploadArea extends HTMLElement {
+  /** @type string */
+  text
+
   connectedCallback() {
     this.render()
   }
 
   render() {
-    const div = document.createElement("div")
+    this.replaceChildren(uploadTemplate.content.cloneNode(true))
 
-    const input = document.createElement("input")
-    input.type = "file"
-    input.addEventListener("change", async () => {
-      const file = input.files[0]
-      const text = await file.text()
-
-      const tree = await getTreeFromZfs(text)
-      console.log("tree", tree)
-
-      const resultItem = document.createElement("result-item")
-      resultItem.tree = tree
-      document.body.appendChild(resultItem)
+    this.querySelector("input[type=file]").addEventListener("change", async (ev) => {
+      const file = ev.currentTarget.files[0]
+      this.text = await file.text()
+      this.showResult()
     })
-    div.appendChild(input)
 
-    this.replaceChildren(div)
+    this.querySelectorAll("input[type=checkbox]").forEach((input) => {
+      input.addEventListener("change", () => {
+        this.showResult()
+      })
+    })
+  }
+
+  async showResult() {
+    if (!this.text) return
+
+    const tree = await getTreeFromZfs(this.text, {
+      includeRenamed: this.querySelector("input[name=includeRenamed]").checked,
+      includeModified: this.querySelector("input[name=includeModified]").checked,
+      includeAdditions: this.querySelector("input[name=includeAdditions]").checked,
+      includeDeletions: this.querySelector("input[name=includeDeletions]").checked,
+    })
+
+    console.log("tree", tree)
+
+    document.body.querySelector("result-item")?.remove()
+    const resultItem = document.createElement("result-item")
+    resultItem.tree = tree
+    document.body.appendChild(resultItem)
   }
 }
 
@@ -225,6 +314,7 @@ class ResultItem extends HTMLElement {
     const div = document.createElement("div")
 
     const hierarchyItem = document.createElement("hierarchy-item")
+    hierarchyItem.isDefaultOpen = true
     hierarchyItem.hierarchy = this.tree
     hierarchyItem.depth = 0
 
